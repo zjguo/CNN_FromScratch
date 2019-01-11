@@ -1,6 +1,5 @@
-# CNN_FromScratch
+# CNN_FromScratch(Unfinished)
 
-(Unfinished)
 ToDo: 
 - Add Backprop for convolutional layers
 - Implement AdamOptimizer
