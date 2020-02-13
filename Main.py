@@ -70,51 +70,50 @@ sparce_label_arr[np.arange(nTrainingLabels), Training_Label_Array] = 1
 def new_weights(shape):
     return np.random.normal(scale=0.1, size=shape)  # Random numbers with std of 0.1 and mean of 0
 
+# Helper function to intialize bias
+def new_bias(len):
+    return np.ones(len)
 
-# Helper function to do batch - normalization
-def normalize(input):
+# Helper function normalize input images
+def normalize_input(input):
 
     tiny = 1e-8
     mean = np.mean(input)
     std = np.std(input)
     out = (input - mean) / (std + tiny)
 
-    return out
+    return out, mean, std
 
+
+# Normalize Training Images
+normalized_input, mean_Training_Imgs, std_Training_Imgs = normalize_input(Training_Images_Array)
 
 # Helper function to convolve an image
 def convolve(input,     # Input will be a 4D tensor: [img_number, rows, cols, num_filters]
              filter,    # Expected shape is [filter_size, filter_size, num_input_channels, num_filters]
+             bias,
              padding='SAME'):
 
-    # Set up filter
-    new_filter = new_weights(filter)
-    new_filter = np.reshape(new_filter, (filter[0]*filter[1]*filter[2],-1), order='F')   # Used to matmul the per_field
-
-    # Set us bias term
-    bias = 1
-
-    mask_buffer = int((filter[0]+1)/2 - 1)  # Start convolution at top left of input
+    mask_buffer = int((filter.shape[0]+1)/2 - 1)  # Start convolution at top left of input
 
     # Pad image with 0s
     npad = ((0, 0), (mask_buffer, mask_buffer+2), (mask_buffer, mask_buffer+2), (0, 0)) # +2 to fix indexing issues
     if padding is 'SAME':
         pad_in = np.pad(input, pad_width=npad, mode='constant', constant_values=0)
 
-    # Make the input in the form [num_images, fsize x fsize x numfilters, num_mask_blocks]
-    processed_input_array = np.zeros((pad_in.shape[0],pad_in.shape[1],pad_in.shape[2],filter[3]))  # Initialize processed array
+    # Initialize output array to have form [num_img, rows(padded), cols(padded), n_output_filter]
+    out_array = np.zeros((pad_in.shape[0],pad_in.shape[1], pad_in.shape[2],filter.shape[3]))  # Initialize processed array
 
     # Iterate over all rows and cols in the input and matmul the perceptive field with the filter
     for i in range(mask_buffer, input.shape[1]+mask_buffer):
         for j in range(mask_buffer, input.shape[2]+mask_buffer):
             per_field = pad_in[:, i-mask_buffer:i+mask_buffer+1, j-mask_buffer:j+mask_buffer+1,:]   # Current perceptive field
-            per_field_line = np.reshape(per_field, (pad_in.shape[0], -1), order='F')    # [num_images, fsizexfsizexnfilters]
-            processed_input_array[:, i, j, :] = np.matmul(per_field_line, new_filter) + bias
+            out_array[:, i, j, :] = np.einsum('ijkl,jklm -> im', per_field, filter) + bias  # Element-wise multiply PF and F + bias
 
     # Trim away the zero padding from processed_input_array
-    processed_input_array = processed_input_array[:,mask_buffer:pad_in.shape[1]-mask_buffer-2,mask_buffer:pad_in.shape[2]-mask_buffer-2,:]
+    out_array = out_array[:,mask_buffer:pad_in.shape[1]-mask_buffer-2,mask_buffer:pad_in.shape[2]-mask_buffer-2,:]
 
-    return  processed_input_array, new_filter
+    return  out_array   # out_array: [img_num, rows, cols, num_filters]
 
 
 # Helper function for max-pooling
@@ -150,26 +149,21 @@ def relu(input):
 
 # Helper function for creating new convolutional layer
 def new_conv_layer(input,   # Input will be a 4D tensor: [img_number, rows, cols, num_filters]
-                   filter_size,
-                   num_input_channels,
-                   num_filters,
+                   weights,
+                   bias,
                    max_pool=True):  # 2x2 max-pool
 
-
-    # Normalize input
-    input = normalize(input)
-
     # Convolve the input with filter
-    out, weights = convolve(input, [filter_size, filter_size, num_input_channels, num_filters], padding='SAME')
+    out = convolve(input, weights, bias, padding='SAME')
 
     # Max pooling
     if max_pool is True:
         out = maxPool_2x2(out)
 
-    # Implement ReLu
+    # ReLu
     out = relu(out)
 
-    return out, weights
+    return out
 
 
 # Helper function to flatten the layer for input into fully connected network
@@ -185,25 +179,24 @@ def flatten(input):
 
 
 # Helper function to make new FC layer
-def new_fc_layer(input, weights, bias, num_outputs):
+def new_fc_layer(input, weights, bias, include_nonlin = True):
 
     input ,num_features = flatten(input)
-
-    # Normalize input
-    input = normalize(input)
 
     out = np.matmul(input, weights) + bias
 
     # Use ReLu
-    out = relu(out)
+    if include_nonlin:
+        out = relu(out)
 
-    return out, weights, bias
+    return out
 
 # Helper function to find softmax
 def softmax(input):
 
     input_exp = np.exp(input)
-    exp_sum = np.sum(input_exp)
+    exp_sum = np.sum(input_exp,axis=1)
+    exp_sum = exp_sum.reshape((exp_sum.shape[0],1))
 
     out = input_exp/exp_sum
 
@@ -211,50 +204,173 @@ def softmax(input):
 
 
 # Helper function to find cross entropy
-def cross_entropy_cost(input):
+def cross_entropy_cost(input, true_label_array):
 
-    out = - np.log(input[[np.arange(input.shape[0])], [Training_Label_Array[0:input.shape[0]]]])
+    input = softmax(input)
+    # Use true label array to pick out prediction corresponding to correct class
+    out = - np.log(input[[np.arange(input.shape[0])], [true_label_array[0:input.shape[0]]]])
     out = np.mean(out)
     return out
 
+# Layers information
+L1_filtersize = 5
+L1_out_channels = 3
+
+L2_filtersize = 3
+L2_out_channels = 3
+
+FC1_neurons  = 128
+n_classes = 10
 
 
-# Helper function to run
-def run( iterations):
+# Helper function to optimize in batches
+def run( iterations, grad_check=False):
     batchsize = 64
-    W3 = new_weights([147, 10])
-    b3 = np.ones((1,10))
+
+    # Initiate all weights and biases
+    W1 = new_weights([L1_filtersize, L1_filtersize, 1, L1_out_channels])
+    b1 = new_bias(L1_out_channels)
+    W2 = new_weights([L2_filtersize, L2_filtersize, L1_out_channels, L2_out_channels])
+    b2 = new_bias(L2_out_channels)
+    W3 = new_weights([7*7*L2_out_channels, FC1_neurons])
+    b3 = new_bias(FC1_neurons)
+    W4 = new_weights([FC1_neurons, n_classes])
+    b4 = new_bias(n_classes)
 
     for i in range(iterations):
         rand_index = np.random.randint(nTrainingImages, size = batchsize)
-        batch_img_arr = Training_Images_Array[rand_index,:,:,:] # Obtain 64 random images from Training_Images_Array
-        learning_rate = 0.01
+        batch_img_arr = normalized_input[rand_index,:,:,:] # Obtain 64 random images from Training_Images_Array
+        learning_rate = 0.001
 
         # First convolutional layer
-        L1, W1 = new_conv_layer(batch_img_arr, filter_size=3, num_input_channels=1, num_filters=3)
+        L1 = new_conv_layer(batch_img_arr, W1, b1, max_pool=True)
 
-        # Third convolutional layer
-        L2, W2 = new_conv_layer(L1, filter_size=3, num_input_channels=3, num_filters=3)
+        # Second convolutional layer
+        L2 = new_conv_layer(L1, W2, b2, max_pool=True)
 
         # Fully Connected layer
-        FC3, W3, b3 = new_fc_layer(L2, W3, b3, num_outputs=10)
+        FC3 = new_fc_layer(L2, W3, b3)
 
-        loss = cross_entropy_cost(softmax(FC3))
+        # Output Layer
+        FC4 = new_fc_layer(FC3, W4, b4, include_nonlin=False)
 
-        # Gradient for FC layer
-        dwFC = np.subtract(softmax(FC3),sparce_label_arr[rand_index,:])
-        dwb3 = dwFC
-        bgt0 = dwb3 > 0
-        dwb3 = dwb3*dwb3
-        flatL2, numL2features = flatten(L2)
-        dwFC = np.matmul(np.transpose(dwFC), flatL2)
-        bgt0 = dwFC > 0
-        dwFC = bgt0*dwFC
+        # Prepare a true label array from the random indexes
+        true_labels = np.asarray(Training_Label_Array)
+        true_labels = true_labels[rand_index]
+
+        # Find cross entropy loss
+        loss = cross_entropy_cost(FC4, true_labels)
+
+        # Gradient for Final layer
+        True_Label_Sparce_Array = sparce_label_arr[rand_index,:]
+        Predict_sub_true = softmax(FC4) - True_Label_Sparce_Array
+        dwb4 = Predict_sub_true
+        dwb4 = np.sum(dwb4,axis=0)/batchsize
+        dW4 = np.matmul(FC3.T,Predict_sub_true)
+        dW4 = dW4/batchsize
+
+        # Gradient for layer 4
+        sensitivity_j = np.matmul(Predict_sub_true, W4.T)
+        # Obtain FC3 before Relu
+        z3 = new_fc_layer(L2, W3, b3, include_nonlin=False)
+        z3_gte0 = z3 >= 0
+        sensitivity_j = sensitivity_j * z3_gte0
+        flatL2, numL2Feat = flatten(L2)
+        dW3 = np.matmul(sensitivity_j.T, flatL2).T / batchsize
+        dwb3 = np.sum(sensitivity_j, axis = 0)/ batchsize
+
+        # Grad check is done in seperate layers for easy debugging
+        if grad_check:
+            # Gradient check for final layer
+            tiny_num = 1e-7
+            tempW4 = W4.copy()
+            tempb4 = b4.copy()
+            test_grad = np.ones(W4.shape)  # Dummy array same size as W4
+            test_gradb = np.ones(b4.shape)  # Dummy array same size as W4
+
+            for i in range(len(W4)):
+                for j in range(len(W4[0])):
+                    # Perturb W4 and obtain loss
+                    tempW4[i][j] = W4[i][j] + tiny_num
+                    FC4_test_upper = new_fc_layer(FC3, tempW4, b4, include_nonlin=False)
+                    tempW4[i][j] = W4[i][j] - tiny_num
+                    FC4_test_lower = new_fc_layer(FC3, tempW4, b4, include_nonlin=False)
+                    tempW4[i][j] = W4[i][j]
+
+                    loss_upper = cross_entropy_cost(FC4_test_upper, true_labels)
+                    loss_lower = cross_entropy_cost(FC4_test_lower, true_labels)
+                    test_grad[i][j] = (loss_upper-loss_lower)/(2*tiny_num)
+
+
+                    # Perturb b4 and obtain loss
+                    tempb4[j] = b4[j] + tiny_num
+                    FC4_test_upperb = new_fc_layer(FC3, W4, tempb4, include_nonlin=False)
+                    tempb4[j] = b4[j] - tiny_num
+                    FC4_test_lowerb = new_fc_layer(FC3, W4, tempb4, include_nonlin=False)
+                    tempb4[j] = b4[j]
+
+                    loss_upper = cross_entropy_cost(FC4_test_upperb, true_labels)
+                    loss_lower = cross_entropy_cost(FC4_test_lowerb, true_labels)
+                    test_gradb[j] = (loss_upper-loss_lower)/(2*tiny_num)
+
+            err = np.linalg.norm(test_grad - dW4) / (np.linalg.norm(test_grad) + np.linalg.norm(dW4))
+            print('W4 error = {}'.format(err))
+            err = np.linalg.norm(test_gradb - dwb4) / (np.linalg.norm(test_gradb) + np.linalg.norm(dwb4))
+            print('dwb4 error = {}'.format(err))
+
+            # Gradient check for first FC layer
+            tempW3 = W3.copy()
+            tempb3 = b3.copy()
+            test_grad = np.ones(W3.shape)  # Dummy array same size as W3
+            test_gradb = np.ones(b3.shape)  # Dummy array same size as W3
+
+            for i in range(len(W3)):
+                for j in range(len(W3[0])):
+                    # Perturb W3 and obtain loss
+                    tempW3[i][j] = W3[i][j] + tiny_num
+                    FC3_test_upper = new_fc_layer(L2, tempW3, b3)
+                    tempW3[i][j] = W3[i][j] - tiny_num
+                    FC3_test_lower = new_fc_layer(L2, tempW3, b3)
+                    tempW3[i][j] = W3[i][j]
+
+                    # do forward pass
+                    FC4_test_upper = new_fc_layer(FC3_test_upper, W4, b4, include_nonlin=False)
+                    FC4_test_lower = new_fc_layer(FC3_test_lower, W4, b4, include_nonlin=False)
+
+                    loss_upper = cross_entropy_cost(FC4_test_upper, true_labels)
+                    loss_lower = cross_entropy_cost(FC4_test_lower, true_labels)
+                    test_grad[i][j] = (loss_upper-loss_lower)/(2*tiny_num)
+
+
+                    # Perturb b3 and obtain loss
+                    tempb3[j] = b3[j] + tiny_num
+                    FC3_test_upperb = new_fc_layer(L2, W3, tempb3)
+                    tempb3[j] = b3[j] - tiny_num
+                    FC3_test_lowerb = new_fc_layer(L2, W3, tempb3)
+                    tempb3[j] = b3[j]
+
+                    # do forward pass
+                    FC4_test_upperb = new_fc_layer(FC3_test_upperb, W4, b4, include_nonlin=False)
+                    FC4_test_lowerb = new_fc_layer(FC3_test_lowerb, W4, b4, include_nonlin=False)
+
+                    loss_upper = cross_entropy_cost(FC4_test_upperb, true_labels)
+                    loss_lower = cross_entropy_cost(FC4_test_lowerb, true_labels)
+                    test_gradb[j] = (loss_upper-loss_lower)/(2*tiny_num)
+
+
+            err = np.linalg.norm(test_grad - dW3) / (np.linalg.norm(test_grad) + np.linalg.norm(dW3))
+            print('W3 error = {}'.format(err))
+            err = np.linalg.norm(test_gradb - dwb3) / (np.linalg.norm(test_gradb) + np.linalg.norm(dwb3))
+            print('dwb3 error = {}'.format(err))
+
 
         # Update FC layer weights
-        W3 = np.add(W3,learning_rate*np.transpose(dwFC))
-        b3 = np.add(b3,np.sum(learning_rate*dwb3, axis = 0))
+        #W4 = W4+learning_rate*dW4
+        #b4 = np.add(b4,np.sum(learning_rate*dwb4, axis = 0))
 
-    return loss
+        print(loss)
 
-print(run(100))
+
+    return
+
+run(1, grad_check=True)
